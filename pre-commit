@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
 Git pre-commit hook: перевірка секретів за допомогою gitleaks.
+Рівень: Middle
+
+Можливості:
+  - Автоматичне встановлення gitleaks залежно від ОС
+  - Увімкнення/вимкнення через git config
+  - Сканування лише staged файлів
+  - Детальний звіт про знайдені секрети
 
 Встановлення:
     cp pre-commit .git/hooks/pre-commit
     chmod +x .git/hooks/pre-commit
 
-Або для всіх репозиторіїв (глобально):
-    git config --global core.hooksPath ~/.git-hooks
-    cp pre-commit ~/.git-hooks/pre-commit
-    chmod +x ~/.git-hooks/pre-commit
+Увімкнення/вимкнення:
+    git config hooks.gitleaks.enable true   # увімкнути (за замовчуванням)
+    git config hooks.gitleaks.enable false  # вимкнути
 """
 
 import subprocess
@@ -18,6 +24,8 @@ import shutil
 import os
 import json
 import tempfile
+import platform
+import urllib.request
 
 
 # ─────────────────────────── Кольори для термінала ───────────────────────────
@@ -36,87 +44,253 @@ def yellow(text): return f"{Color.YELLOW}{text}{Color.RESET}"
 def cyan(text):   return f"{Color.CYAN}{text}{Color.RESET}"
 def bold(text):   return f"{Color.BOLD}{text}{Color.RESET}"
 
-
-# ──────────────────────────── Допоміжні функції ───────────────────────────────
-
-def print_banner(title: str, color_fn=cyan) -> None:
+def print_banner(title: str, color_fn=None) -> None:
+    if color_fn is None:
+        color_fn = cyan
     line = "─" * 60
     print(f"\n{color_fn(line)}")
     print(f"{color_fn('  ' + title)}")
     print(f"{color_fn(line)}\n")
 
 
-def check_gitleaks_installed() -> str:
-    """Перевіряє наявність gitleaks у PATH. Повертає шлях або завершує хук."""
+# ──────────────────────── git config enable/disable ──────────────────────────
+
+def is_hook_enabled() -> bool:
+    """
+    Перевіряє git config hooks.gitleaks.enable
+    Якщо не встановлено — вважається увімкненим (true за замовчуванням).
+    """
+    result = subprocess.run(
+        ["git", "config", "--get", "hooks.gitleaks.enable"],
+        capture_output=True,
+        text=True,
+    )
+    # Якщо ключ не знайдено — вмикаємо за замовчуванням
+    if result.returncode != 0:
+        return True
+
+    value = result.stdout.strip().lower()
+    return value != "false"
+
+
+# ──────────────────────── Автоматичне встановлення ───────────────────────────
+
+GITLEAKS_VERSION = "8.18.4"
+GITLEAKS_RELEASES = "https://github.com/gitleaks/gitleaks/releases/download"
+
+
+def get_os_info() -> tuple[str, str]:
+    """Повертає (os_name, arch) для визначення правильного бінарника."""
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    # Нормалізуємо архітектуру
+    if machine in ("x86_64", "amd64"):
+        arch = "x64"
+    elif machine in ("aarch64", "arm64"):
+        arch = "arm64"
+    elif machine in ("armv7l", "armv6l"):
+        arch = "armv7"
+    else:
+        arch = machine
+
+    return system, arch
+
+
+def install_gitleaks_macos() -> bool:
+    """Встановлює gitleaks через Homebrew на macOS."""
+    brew = shutil.which("brew")
+    if not brew:
+        print(yellow("   Homebrew не знайдено. Встановіть його з https://brew.sh"))
+        print("   Або встановіть gitleaks вручну:")
+        print(f"   {GITLEAKS_RELEASES}/v{GITLEAKS_VERSION}/")
+        return False
+
+    print("   Встановлення через Homebrew...")
+    result = subprocess.run(
+        ["brew", "install", "gitleaks"],
+        capture_output=False,  # показуємо прогрес
+    )
+    return result.returncode == 0
+
+
+def install_gitleaks_linux(arch: str) -> bool:
+    """Завантажує gitleaks binary з GitHub Releases на Linux."""
+    # Формуємо URL для завантаження
+    filename = f"gitleaks_{GITLEAKS_VERSION}_linux_{arch}.tar.gz"
+    url = f"{GITLEAKS_RELEASES}/v{GITLEAKS_VERSION}/{filename}"
+
+    install_dir = os.path.expanduser("~/.local/bin")
+    os.makedirs(install_dir, exist_ok=True)
+    dest = os.path.join(install_dir, "gitleaks")
+
+    print(f"   Завантаження {filename}...")
+    print(f"   URL: {url}")
+
+    try:
+        tmp_dir = tempfile.mkdtemp()
+        archive_path = os.path.join(tmp_dir, filename)
+
+        # Завантажуємо архів
+        urllib.request.urlretrieve(url, archive_path)
+
+        # Розпаковуємо
+        subprocess.run(
+            ["tar", "-xzf", archive_path, "-C", tmp_dir],
+            check=True,
+        )
+
+        # Копіюємо бінарник
+        src = os.path.join(tmp_dir, "gitleaks")
+        shutil.copy2(src, dest)
+        os.chmod(dest, 0o755)
+
+        # Перевіряємо чи ~/.local/bin у PATH
+        if install_dir not in os.environ.get("PATH", ""):
+            print(yellow(f"\n   ⚠  Додайте до ~/.bashrc або ~/.zshrc:"))
+            print(f'   export PATH="$PATH:{install_dir}"')
+            print(f"   Потім: source ~/.bashrc\n")
+
+        print(green(f"   ✔  gitleaks встановлено у {dest}"))
+        return True
+
+    except Exception as e:
+        print(red(f"   ✖  Помилка встановлення: {e}"))
+        return False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def install_gitleaks_windows() -> bool:
+    """Встановлює gitleaks на Windows через winget або choco."""
+    # Спробуємо winget (вбудований у Windows 11+)
+    if shutil.which("winget"):
+        print("   Встановлення через winget...")
+        result = subprocess.run(
+            ["winget", "install", "gitleaks"],
+            capture_output=False,
+        )
+        if result.returncode == 0:
+            return True
+
+    # Спробуємо Chocolatey
+    if shutil.which("choco"):
+        print("   Встановлення через Chocolatey...")
+        result = subprocess.run(
+            ["choco", "install", "gitleaks", "-y"],
+            capture_output=False,
+        )
+        return result.returncode == 0
+
+    print(yellow("   Встановіть gitleaks вручну:"))
+    print(f"   {GITLEAKS_RELEASES}/v{GITLEAKS_VERSION}/")
+    return False
+
+
+def auto_install_gitleaks() -> bool:
+    """Визначає ОС і встановлює gitleaks відповідним способом."""
+    print_banner("📦  Автоматичне встановлення gitleaks", color_fn=yellow)
+
+    system, arch = get_os_info()
+    print(f"   Система : {bold(system)}")
+    print(f"   Архітек.: {bold(arch)}\n")
+
+    if system == "darwin":
+        success = install_gitleaks_macos()
+    elif system == "linux":
+        success = install_gitleaks_linux(arch)
+    elif system == "windows":
+        success = install_gitleaks_windows()
+    else:
+        print(red(f"   ✖  Непідтримувана ОС: {system}"))
+        print(f"   Встановіть gitleaks вручну: {GITLEAKS_RELEASES}/v{GITLEAKS_VERSION}/")
+        success = False
+
+    return success
+
+
+def check_or_install_gitleaks() -> str:
+    """
+    Перевіряє наявність gitleaks.
+    Якщо відсутній — намагається встановити автоматично.
+    Повертає шлях до gitleaks або завершує хук.
+    """
+    # Перевірити стандартний PATH
     path = shutil.which("gitleaks")
     if path:
         return path
 
-    print(red("✖  gitleaks не знайдено у PATH."))
-    print(yellow("   Встановіть його одним зі способів:"))
-    print("     • macOS:   brew install gitleaks")
-    print("     • Linux:   https://github.com/gitleaks/gitleaks/releases")
-    print("     • pip:     pip install gitleaks  (обгортка)")
-    print()
-    print(yellow("   Щоб пропустити перевірку одноразово:"))
-    print("     SKIP_GITLEAKS=1 git commit ...")
-    sys.exit(1)
+    # Перевірити ~/.local/bin (після нашого встановлення на Linux)
+    local_bin = os.path.join(os.path.expanduser("~"), ".local", "bin", "gitleaks")
+    if os.path.exists(local_bin):
+        return local_bin
 
+    print(yellow("⚠  gitleaks не знайдено — спробуємо встановити автоматично...\n"))
+
+    success = auto_install_gitleaks()
+
+    if not success:
+        print(red("\n✖  Не вдалось встановити gitleaks автоматично."))
+        print(yellow("   Встановіть вручну та повторіть коміт."))
+        print()
+        print(yellow("   Щоб пропустити перевірку одноразово:"))
+        print("     SKIP_GITLEAKS=1 git commit ...")
+        sys.exit(1)
+
+    # Шукаємо ще раз після встановлення
+    path = shutil.which("gitleaks") or local_bin
+    if not os.path.exists(path):
+        print(red("✖  gitleaks встановлено але не знайдено у PATH."))
+        print(yellow("   Перезапустіть термінал і спробуйте знову."))
+        sys.exit(1)
+
+    print(green(f"\n✔  gitleaks успішно встановлено: {path}"))
+    return path
+
+
+# ──────────────────────────── Staged файли ───────────────────────────────────
 
 def get_staged_files() -> list[str]:
-    """Повертає список staged файлів (лише додані/змінені, не видалені)."""
+    """Повертає список staged файлів (лише додані/змінені)."""
     result = subprocess.run(
         ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
         capture_output=True,
         text=True,
     )
-    files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
-    return files
+    return [f.strip() for f in result.stdout.splitlines() if f.strip()]
 
 
 def export_staged_content(staged_files: list[str]) -> str:
-    """
-    Зберігає staged-вміст файлів у тимчасову директорію.
-    Це дозволяє сканувати саме ті зміни, що йдуть у коміт,
-    а не поточний стан робочої директорії.
-    """
+    """Зберігає staged-вміст файлів у тимчасову директорію."""
     tmp_dir = tempfile.mkdtemp(prefix="gitleaks_staged_")
-
     for filepath in staged_files:
         result = subprocess.run(
             ["git", "show", f":{filepath}"],
             capture_output=True,
         )
         if result.returncode != 0:
-            continue  # файл міг бути видалений або бінарний
-
+            continue
         dest = os.path.join(tmp_dir, filepath)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         with open(dest, "wb") as f:
             f.write(result.stdout)
-
     return tmp_dir
 
 
-def run_gitleaks(gitleaks_bin: str, scan_dir: str) -> tuple[int, list[dict]]:
-    """
-    Запускає gitleaks у режимі 'detect' для вказаної директорії.
-    Повертає (exit_code, список знахідок).
-    """
-    report_file = os.path.join(scan_dir, "_gitleaks_report.json")
+# ──────────────────────────── gitleaks scan ──────────────────────────────────
 
+def run_gitleaks(gitleaks_bin: str, scan_dir: str) -> tuple[int, list[dict]]:
+    """Запускає gitleaks та повертає (exit_code, знахідки)."""
+    report_file = os.path.join(scan_dir, "_gitleaks_report.json")
     cmd = [
-        gitleaks_bin,
-        "detect",
+        gitleaks_bin, "detect",
         "--source", scan_dir,
         "--report-format", "json",
         "--report-path", report_file,
-        "--no-git",          # директорія без .git — скануємо як файли
-        "--exit-code", "1",  # повертає 1, якщо знайдено секрети
+        "--no-git",
+        "--exit-code", "1",
     ]
-
     result = subprocess.run(cmd, capture_output=True, text=True)
-
     findings = []
     if os.path.exists(report_file):
         try:
@@ -125,26 +299,21 @@ def run_gitleaks(gitleaks_bin: str, scan_dir: str) -> tuple[int, list[dict]]:
                 findings = data if isinstance(data, list) else []
         except (json.JSONDecodeError, IOError):
             pass
-
     return result.returncode, findings
 
 
 def print_findings(findings: list[dict], scan_dir: str) -> None:
-    """Виводить зрозумілий звіт про знайдені секрети."""
+    """Виводить звіт про знайдені секрети."""
     print_banner("🔐  Знайдені секрети", color_fn=red)
-
     for i, finding in enumerate(findings, start=1):
-        # Нормалізуємо шлях назад до відносного
         raw_file = finding.get("File", "невідомий файл")
         rel_file = os.path.relpath(raw_file, scan_dir) if scan_dir in raw_file else raw_file
-
         rule        = finding.get("RuleID", "—")
         description = finding.get("Description", "—")
         secret      = finding.get("Secret", "")
         line        = finding.get("StartLine", "?")
-        commit      = finding.get("Commit", "")
+        entropy     = finding.get("Entropy", 0)
 
-        # Маскуємо секрет: показуємо лише перші 4 та останні 4 символи
         if len(secret) > 8:
             masked = secret[:4] + "*" * (len(secret) - 8) + secret[-4:]
         else:
@@ -154,69 +323,72 @@ def print_findings(findings: list[dict], scan_dir: str) -> None:
         print(f"       Правило     : {yellow(rule)}")
         print(f"       Опис        : {description}")
         print(f"       Секрет      : {red(masked)}")
-        if commit:
-            print(f"       Коміт       : {commit}")
+        print(f"       Ентропія    : {entropy:.3f}")
         print()
 
 
 def cleanup(tmp_dir: str) -> None:
-    import shutil as _shutil
-    _shutil.rmtree(tmp_dir, ignore_errors=True)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ─────────────────────────────── Головна логіка ──────────────────────────────
 
 def main() -> None:
-    print_banner("🔍  Gitleaks Pre-Commit Hook")
+    print_banner("🔍  Gitleaks Pre-Commit Hook  [middle]")
 
-    # Можливість пропустити перевірку через змінну середовища
+    # 1. Перевірка SKIP_GITLEAKS
     if os.environ.get("SKIP_GITLEAKS"):
         print(yellow("⚠  SKIP_GITLEAKS встановлено — перевірку пропущено."))
         sys.exit(0)
 
-    # 1. Перевірка наявності gitleaks
-    gitleaks_bin = check_gitleaks_installed()
-    print(green(f"✔  gitleaks знайдено: {gitleaks_bin}"))
+    # 2. Перевірка git config hooks.gitleaks.enable
+    if not is_hook_enabled():
+        print(yellow("⚠  Hook вимкнено через git config (hooks.gitleaks.enable=false)."))
+        print(yellow("   Щоб увімкнути: git config hooks.gitleaks.enable true"))
+        sys.exit(0)
 
-    # 2. Отримати staged файли
+    # 3. Перевірка/встановлення gitleaks
+    gitleaks_bin = check_or_install_gitleaks()
+    print(green(f"✔  gitleaks: {gitleaks_bin}"))
+
+    # 4. Staged файли
     staged_files = get_staged_files()
     if not staged_files:
         print(green("✔  Немає staged файлів для перевірки."))
         sys.exit(0)
 
-    print(cyan(f"   Staged файли ({len(staged_files)}):"))
+    print(cyan(f"\n   Staged файли ({len(staged_files)}):"))
     for f in staged_files:
         print(f"     • {f}")
     print()
 
-    # 3. Експортувати staged-контент у тимчасову директорію
+    # 5. Експорт staged контенту
     print("   Підготовка staged-контенту...")
     tmp_dir = export_staged_content(staged_files)
 
-    # 4. Запустити gitleaks
+    # 6. Сканування
     print("   Сканування на секрети...\n")
     exit_code, findings = run_gitleaks(gitleaks_bin, tmp_dir)
-
-    # 5. Прибрати тимчасові файли
     cleanup(tmp_dir)
 
-    # 6. Результат
+    # 7. Результат
     if exit_code == 0 or not findings:
         print(green("✔  Секретів не знайдено. Коміт дозволено.\n"))
         sys.exit(0)
     else:
         print_findings(findings, tmp_dir)
-        print(red("✖  Коміт заблоковано — знайдено потенційні секрети!"))
+        print(red("╔══════════════════════════════════════════════════════════╗"))
+        print(red("║  ✖  КОМІТ ВІДХИЛЕНО — знайдено потенційні секрети!      ║"))
+        print(red("╚══════════════════════════════════════════════════════════╝"))
         print()
         print(yellow("   Що робити:"))
-        print("     1. Видаліть або замініть секрети на змінні середовища (.env)")
-        print("     2. Додайте файл до .gitignore, якщо він не повинен трекатись")
-        print("     3. Якщо це хибне спрацювання — використайте:")
-        print("          gitleaks detect --baseline-path .gitleaks-baseline.json")
-        print("        або додайте коментар  # gitleaks:allow  поруч з рядком")
+        print("     1. Замініть секрети на змінні середовища (.env)")
+        print("     2. Додайте .env до .gitignore")
+        print("     3. Якщо хибне спрацювання — додайте коментар:")
+        print("          # gitleaks:allow")
         print()
-        print(yellow("   Щоб пропустити перевірку (лише якщо впевнені!):"))
-        print("     SKIP_GITLEAKS=1 git commit ...")
+        print(yellow("   Щоб тимчасово вимкнути hook:"))
+        print("     git config hooks.gitleaks.enable false")
         print()
         sys.exit(1)
 

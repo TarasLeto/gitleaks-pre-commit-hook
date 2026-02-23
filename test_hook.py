@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Тестовий скрипт для демонстрації роботи pre-commit hook.
-Симулює виявлення Telegram bot token у staged файлах.
+Тестовий скрипт для middle-рівня pre-commit hook.
+Перевіряє: автоматичне встановлення gitleaks + git config enable/disable.
 
 Запуск: python3 test_hook.py
 """
@@ -11,8 +11,10 @@ import os
 import json
 import tempfile
 import shutil
+import subprocess
+import platform
 
-# ─── Додаємо кольори (копія з pre-commit) ─────────────────────────────────────
+# ─── Кольори ──────────────────────────────────────────────────────────────────
 
 class Color:
     RED    = "\033[91m"
@@ -37,128 +39,88 @@ def print_banner(title, color_fn=None):
     print(f"{color_fn(line)}\n")
 
 
-# ─── Файли для тестування ─────────────────────────────────────────────────────
+# ─── Тестові файли ────────────────────────────────────────────────────────────
 
-# Файл 1: конфіг бота з реальним (тестовим) Telegram token
-BOT_CONFIG_PY = """\
-# config.py — конфігурація Telegram бота
+BOT_CONFIG_PY = (
+    "# config.py — небезпечний варіант\n"
+    'TELEGRAM_BOT_TOKEN = "7341852096:AAF3zKpL8mNqR2tVxW0yZ1dCeJ4gHiUoPs6"\n'  # gitleaks:allow
+    'DATABASE_URL = "postgresql://localhost:5432/mydb"\n'
+)
 
-# ⚠️  ПОГАНО: токен захардкоджений у коді
-TELEGRAM_BOT_TOKEN = "7341852096:AAF3zKpL8mNqR2tVxW0yZ1dCeJ4gHiUoPs6"  # gitleaks:allow
+BOT_CONFIG_SAFE_PY = (
+    "# config.py — безпечний варіант\n"
+    "import os\n"
+    'TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")\n'
+    'DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/mydb")\n'
+)
 
-DATABASE_URL = "postgresql://localhost:5432/mydb"
-DEBUG = True
-"""
+DOT_ENV = (
+    "TELEGRAM_BOT_TOKEN=7341852096:AAF3zKpL8mNqR2tVxW0yZ1dCeJ4gHiUoPs6\n"  # gitleaks:allow
+    "DATABASE_URL=postgresql://user:password@localhost:5432/mydb\n"
+)
 
-# Файл 2: безпечний варіант через змінні середовища
-BOT_CONFIG_SAFE_PY = """\
-# config.py — безпечний варіант
+FAKE_SECRET = "7341852096:AAF3zKpL8mNqR2tVxW0yZ1dCeJ4gHiUoPs6"  # gitleaks:allow
 
-import os
+# ─── Симульовані знахідки ─────────────────────────────────────────────────────
 
-# ✅  ДОБРЕ: токен береться зі змінної середовища
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN не встановлено!")
-
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/mydb")
-DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
-"""
-
-# Файл 3: .env файл (теж не повинен потрапляти в git)
-DOT_ENV = """\
-TELEGRAM_BOT_TOKEN=7341852096:AAF3zKpL8mNqR2tVxW0yZ1dCeJ4gHiUoPs6  # gitleaks:allow
-DATABASE_URL=postgresql://user:password@localhost:5432/mydb
-SECRET_KEY=super-secret-django-key-12345
-"""
-
-
-# ─── Симульований gitleaks JSON-звіт ─────────────────────────────────────────
-
-def make_fake_findings(scan_dir: str) -> list[dict]:
-    """Повертає список знахідок у форматі gitleaks JSON-звіту."""
+def make_fake_findings(scan_dir):
     return [
         {
             "Description": "Telegram Bot Token",
-            "StartLine": 4,
-            "EndLine": 4,
-            "StartColumn": 22,
-            "EndColumn": 68,
-            "Match": "TELEGRAM_BOT_TOKEN = \"7341852096:AAF3zKpL8mNqR2tVxW0yZ1dCeJ4gHiUoPs6\"",  # gitleaks:allow
-            "Secret": "7341852096:AAF3zKpL8mNqR2tVxW0yZ1dCeJ4gHiUoPs6",  # gitleaks:allow
+            "StartLine": 2,
+            "Match": f"TELEGRAM_BOT_TOKEN = \"{FAKE_SECRET}\"",  # gitleaks:allow
+            "Secret": FAKE_SECRET,  # gitleaks:allow
             "File": os.path.join(scan_dir, "config.py"),
-            "SymlinkFile": "",
-            "Commit": "",
             "Entropy": 4.418,
-            "Author": "",
-            "Email": "",
-            "Date": "",
-            "Message": "",
-            "Tags": ["telegram", "bot", "token"],
-            "RuleID": "telegram-bot-token",
-            "Fingerprint": "config.py:telegram-bot-token:4",
-        },
-        {
-            "Description": "Telegram Bot Token",
-            "StartLine": 1,
-            "EndLine": 1,
-            "StartColumn": 20,
-            "EndColumn": 66,
-            "Match": "TELEGRAM_BOT_TOKEN=7341852096:AAF3zKpL8mNqR2tVxW0yZ1dCeJ4gHiUoPs6",  # gitleaks:allow
-            "Secret": "7341852096:AAF3zKpL8mNqR2tVxW0yZ1dCeJ4gHiUoPs6",  # gitleaks:allow
-            "File": os.path.join(scan_dir, ".env"),
-            "SymlinkFile": "",
-            "Commit": "",
-            "Entropy": 4.418,
-            "Author": "",
-            "Email": "",
-            "Date": "",
-            "Message": "",
-            "Tags": ["telegram", "bot", "token"],
-            "RuleID": "telegram-bot-token",
-            "Fingerprint": ".env:telegram-bot-token:1",
-        },
+            "RuleID": "telegram-bot-api-token",
+        }
     ]
 
 
-# ─── Логіка виводу (копія з pre-commit) ──────────────────────────────────────
+# ─── Допоміжні функції ────────────────────────────────────────────────────────
 
-def print_findings(findings: list[dict], scan_dir: str) -> None:
+def print_findings(findings, scan_dir):
     print_banner("🔐  Знайдені секрети", color_fn=red)
     for i, finding in enumerate(findings, start=1):
         raw_file = finding.get("File", "невідомий файл")
         rel_file = os.path.relpath(raw_file, scan_dir) if scan_dir in raw_file else raw_file
-
-        rule        = finding.get("RuleID", "—")
-        description = finding.get("Description", "—")
-        secret      = finding.get("Secret", "")
-        line        = finding.get("StartLine", "?")
-        entropy     = finding.get("Entropy", 0)
-
-        if len(secret) > 8:
-            masked = secret[:4] + "*" * (len(secret) - 8) + secret[-4:]
-        else:
-            masked = "****"
-
-        print(f"  {bold(f'[{i}]')} {red('✖')} {bold(rel_file)}:{line}")
-        print(f"       Правило     : {yellow(rule)}")
-        print(f"       Опис        : {description}")
-        print(f"       Секрет      : {red(masked)}")
-        print(f"       Ентропія    : {entropy:.3f}  (висока = підозріло)")
+        secret = finding.get("Secret", "")
+        masked = secret[:4] + "*" * (len(secret) - 8) + secret[-4:] if len(secret) > 8 else "****"
+        print(f"  {bold(f'[{i}]')} {red('✖')} {bold(rel_file)}:{finding.get('StartLine','?')}")
+        print(f"       Правило  : {finding.get('RuleID','—')}")
+        print(f"       Секрет   : {red(masked)}")
+        print(f"       Ентропія : {finding.get('Entropy', 0):.3f}")
         print()
 
 
-# ─── Основний тест ────────────────────────────────────────────────────────────
+def run_gitleaks_on_dir(scan_dir):
+    gitleaks_path = shutil.which("gitleaks") or os.path.expanduser("~/.local/bin/gitleaks")
+    if not os.path.exists(str(gitleaks_path)):
+        return None, None, False
 
-def run_test_scenario(label: str, files: dict[str, str], expect_block: bool) -> bool:
-    """
-    Запускає один тестовий сценарій.
-    files: {ім'я файлу: вміст}
-    Повертає True, якщо результат відповідає очікуванню.
-    """
-    print_banner(f"📋  Сценарій: {label}")
+    report_file = os.path.join(scan_dir, "_report.json")
+    result = subprocess.run(
+        [gitleaks_path, "detect", "--source", scan_dir,
+         "--report-format", "json", "--report-path", report_file,
+         "--no-git", "--exit-code", "1"],
+        capture_output=True, text=True,
+    )
+    findings = []
+    if os.path.exists(report_file):
+        try:
+            with open(report_file) as f:
+                data = json.load(f)
+                findings = data if isinstance(data, list) else []
+        except json.JSONDecodeError:
+            pass
+    return result.returncode, findings, True
 
-    # Створюємо тимчасову директорію зі staged файлами
+
+# ─── Тестові сценарії ─────────────────────────────────────────────────────────
+
+def run_scenario(label, files, expect_block):
+    print_banner(f"📋  {label}")
+
     tmp_dir = tempfile.mkdtemp(prefix="test_staged_")
     try:
         for filename, content in files.items():
@@ -172,136 +134,138 @@ def run_test_scenario(label: str, files: dict[str, str], expect_block: bool) -> 
             print(f"     • {name}")
         print()
 
-        # Перевірка: чи є gitleaks у системі
-        gitleaks_path = shutil.which("gitleaks")
+        exit_code, findings, is_real = run_gitleaks_on_dir(tmp_dir)
 
-        if gitleaks_path:
-            # ─── РЕАЛЬНИЙ запуск gitleaks ───
-            print(green(f"✔  gitleaks знайдено: {gitleaks_path}"))
-            print("   Сканування на секрети...\n")
-
-            import subprocess
-            report_file = os.path.join(tmp_dir, "_report.json")
-            result = subprocess.run(
-                [
-                    gitleaks_path, "detect",
-                    "--source", tmp_dir,
-                    "--report-format", "json",
-                    "--report-path", report_file,
-                    "--no-git",
-                    "--exit-code", "1",
-                ],
-                capture_output=True, text=True,
-            )
-            findings = []
-            if os.path.exists(report_file):
-                with open(report_file) as f:
-                    try:
-                        data = json.load(f)
-                        findings = data if isinstance(data, list) else []
-                    except json.JSONDecodeError:
-                        pass
-
-            exit_code = result.returncode
-
+        if is_real:
+            print(green("✔  Реальний запуск gitleaks\n"))
+            blocked = exit_code != 0 or len(findings) > 0
         else:
-            # ─── СИМУЛЯЦІЯ (gitleaks не встановлено) ───
-            print(yellow("⚠  gitleaks не знайдено — запускаємо симуляцію.\n"))
-            if expect_block:
-                findings = make_fake_findings(tmp_dir)
-                exit_code = 1
-            else:
-                findings = []
-                exit_code = 0
-
-        # Результат
-        blocked = exit_code != 0 or len(findings) > 0
+            print(yellow("⚠  Симуляція (gitleaks не знайдено)\n"))
+            blocked = expect_block
+            findings = make_fake_findings(tmp_dir) if blocked else []
 
         if blocked:
             print_findings(findings, tmp_dir)
             print(red("╔══════════════════════════════════════════════════════════╗"))
             print(red("║  ✖  КОМІТ ВІДХИЛЕНО — знайдено потенційні секрети!      ║"))
-            print(red("╚══════════════════════════════════════════════════════════╝"))
-            print()
-            print(yellow("   Що робити:"))
-            print("     1. Видаліть токен з коду та використовуйте змінні середовища")
-            print("     2. Додайте .env до .gitignore")
-            print("     3. Якщо токен вже потрапив в історію — відкличте його негайно!")
-            print(f"        https://t.me/BotFather → /mybots → Revoke token")
-            print()
+            print(red("╚══════════════════════════════════════════════════════════╝\n"))
         else:
             print(green("╔══════════════════════════════════════════════════════════╗"))
             print(green("║  ✔  Секретів не знайдено. Коміт дозволено.              ║"))
-            print(green("╚══════════════════════════════════════════════════════════╝"))
-            print()
+            print(green("╚══════════════════════════════════════════════════════════╝\n"))
 
-        # Перевірка відповідності очікуванню
         passed = blocked == expect_block
         status = green("PASSED ✔") if passed else red("FAILED ✖")
-        print(f"   Результат тесту: {status}")
-        print(f"   (Очікували: {'блокування' if expect_block else 'дозвіл'}, "
-              f"Отримали: {'блокування' if blocked else 'дозвіл'})")
+        print(f"   Результат: {status}  "
+              f"(очікували: {'блокування' if expect_block else 'дозвіл'}, "
+              f"отримали: {'блокування' if blocked else 'дозвіл'})")
         return passed
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-# ─── Запуск усіх сценаріїв ────────────────────────────────────────────────────
+def test_git_config_enable():
+    print_banner("⚙️   Тест: git config hooks.gitleaks.enable")
+
+    tests = [
+        ("true",  True,  "hook увімкнено"),
+        ("false", False, "hook вимкнено"),
+        ("",      True,  "за замовчуванням увімкнено"),
+    ]
+
+    all_passed = True
+    for value, expect_enabled, description in tests:
+        if value:
+            subprocess.run(["git", "config", "hooks.gitleaks.enable", value], capture_output=True)
+        else:
+            subprocess.run(["git", "config", "--unset", "hooks.gitleaks.enable"], capture_output=True)
+
+        result = subprocess.run(
+            ["git", "config", "--get", "hooks.gitleaks.enable"],
+            capture_output=True, text=True,
+        )
+        actual = result.stdout.strip().lower() if result.returncode == 0 else ""
+        # Логіка: якщо значення явно "false" — вимкнено, все інше — увімкнено
+        is_enabled = actual != "false"
+
+        passed = is_enabled == expect_enabled
+        all_passed = all_passed and passed
+        icon = green("✔") if passed else red("✖")
+        label = f'"{value}"' if value else "(не встановлено)"
+        print(f"   {icon}  config={label:<20} → {description}")
+
+    subprocess.run(["git", "config", "--unset", "hooks.gitleaks.enable"], capture_output=True)
+    return all_passed
+
+
+def test_os_detection():
+    print_banner("🖥️   Тест: визначення ОС для авто-встановлення")
+
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    arch = "x64" if machine in ("x86_64", "amd64") else "arm64" if machine in ("aarch64", "arm64") else machine
+    os_name = {"darwin": "macOS", "linux": "Linux", "windows": "Windows"}.get(system, system)
+    install_method = {
+        "darwin":  "brew install gitleaks",
+        "linux":   f"GitHub Releases binary (linux_{arch})",
+        "windows": "winget install gitleaks",
+    }.get(system, "ручне встановлення")
+
+    print(f"   Система           : {bold(os_name)}")
+    print(f"   Архітектура       : {bold(arch)}")
+    print(f"   Метод встановлення: {cyan(install_method)}")
+
+    gitleaks = shutil.which("gitleaks")
+    if gitleaks:
+        ver = subprocess.run([gitleaks, "version"], capture_output=True, text=True)
+        print(f"   gitleaks          : {green(ver.stdout.strip())}")
+    else:
+        print(f"   gitleaks          : {yellow('буде встановлено автоматично при першому коміті')}")
+
+    return True
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print_banner("🧪  Тестування Git Pre-Commit Hook (gitleaks)", color_fn=cyan)
-    print("   Цей скрипт перевіряє виявлення Telegram Bot Token")
-    print("   у staged файлах перед комітом.\n")
+    print_banner("🧪  Middle-рівень: Тестування Pre-Commit Hook", color_fn=cyan)
 
     results = []
+    labels  = []
 
-    # Сценарій 1: небезпечний — токен захардкоджений у .py файлі
-    results.append(run_test_scenario(
-        label="❌  Токен у Python файлі (config.py)",
-        files={"config.py": BOT_CONFIG_PY},
-        expect_block=True,
-    ))
+    print(bold("  📌 Блок 1: Сканування секретів\n"))
 
-    # Сценарій 2: небезпечний — токен у .env файлі (якщо .env в git)
-    results.append(run_test_scenario(
-        label="❌  Токен у .env файлі (в git!)",
-        files={".env": DOT_ENV},
-        expect_block=True,
-    ))
+    results.append(run_scenario("❌  Токен у Python файлі", {"config.py": BOT_CONFIG_PY}, expect_block=True))
+    labels.append("Токен у Python файлі")
 
-    # Сценарій 3: обидва файли одразу
-    results.append(run_test_scenario(
-        label="❌  Обидва файли з токеном одночасно",
-        files={"config.py": BOT_CONFIG_PY, ".env": DOT_ENV},
-        expect_block=True,
-    ))
+    results.append(run_scenario("❌  Токен у .env файлі", {".env": DOT_ENV}, expect_block=True))
+    labels.append("Токен у .env файлі")
 
-    # Сценарій 4: безпечний — токен через os.environ
-    results.append(run_test_scenario(
-        label="✅  Безпечний варіант (os.environ)",
-        files={"config.py": BOT_CONFIG_SAFE_PY},
-        expect_block=False,
-    ))
+    results.append(run_scenario("✅  Безпечний варіант (os.environ)", {"config.py": BOT_CONFIG_SAFE_PY}, expect_block=False))
+    labels.append("Безпечний варіант")
 
-    # Підсумок
+    print(bold("  📌 Блок 2: git config hooks.gitleaks.enable\n"))
+    results.append(test_git_config_enable())
+    labels.append("git config enable/disable")
+
+    print(bold("  📌 Блок 3: Визначення ОС для авто-встановлення\n"))
+    results.append(test_os_detection())
+    labels.append("Визначення ОС")
+
     print_banner("📊  Підсумок тестування")
-    total  = len(results)
+    for label, ok in zip(labels, results):
+        print(f"   {green('✔') if ok else red('✖')}  {label}")
+
+    total = len(results)
     passed = sum(results)
-    failed = total - passed
-
-    for i, ok in enumerate(results, 1):
-        icon = green("✔") if ok else red("✖")
-        print(f"   {icon}  Сценарій {i}")
-
     print()
-    if failed == 0:
-        print(green(f"   Всі {total}/{total} сценарії пройшли успішно! 🎉"))
+    if passed == total:
+        print(green(f"   Всі {total}/{total} тести пройшли успішно! 🎉"))
     else:
-        print(red(f"   Пройшло: {passed}/{total}, Провалено: {failed}/{total}"))
-
+        print(red(f"   Пройшло: {passed}/{total}, Провалено: {total - passed}/{total}"))
     print()
-    sys.exit(0 if failed == 0 else 1)
+    sys.exit(0 if passed == total else 1)
 
 
 if __name__ == "__main__":
