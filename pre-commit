@@ -333,21 +333,63 @@ def cleanup(tmp_dir: str) -> None:
 
 # ─────────────────────────────── Головна логіка ──────────────────────────────
 
+def print_status() -> None:
+    """Виводить поточний статус hook'а перед кожним комітом."""
+    result = subprocess.run(
+        ["git", "config", "--get", "hooks.gitleaks.enable"],
+        capture_output=True, text=True,
+    )
+    config_value = result.stdout.strip().lower() if result.returncode == 0 else None
+    enabled = config_value != "false"
+
+    print("  ┌─────────────────────────────────────────────────────┐")
+    print("  │  Статус Gitleaks Hook                               │")
+    print("  ├─────────────────────────────────────────────────────┤")
+
+    if enabled:
+        print(f"  │  Статус    : {green('✔  Увімкнено')}                                │")
+    else:
+        print(f"  │  Статус    : {red('✖  Вимкнено')}                                 │")
+
+    if config_value is None:
+        print(f"  │  git config: {yellow('не встановлено (за замовчуванням увімкнено)')}  │")
+    elif config_value == "true":
+        print(f"  │  git config: {green('true  (явно увімкнено)')}                       │")
+    else:
+        print(f"  │  git config: {red('false (явно вимкнено)')}                        │")
+
+    print("  ├─────────────────────────────────────────────────────┤")
+
+    if enabled:
+        print(f"  │  Щоб вимкнути:                                      │")
+        print(f"  │    git config hooks.gitleaks.enable false           │")
+        print(f"  │  Щоб пропустити одноразово:                         │")
+        print(f"  │    SKIP_GITLEAKS=1 git commit                       │")
+    else:
+        print(f"  │  ⚠  Hook вимкнено — секрети НЕ перевіряються!      │")
+        print(f"  │  Щоб увімкнути:                                     │")
+        print(f"  │    git config hooks.gitleaks.enable true            │")
+
+    print("  └─────────────────────────────────────────────────────┘")
+    print()
+
+
 def main() -> None:
     print_banner("🔍  Gitleaks Pre-Commit Hook  [middle]")
 
-    # 1. Перевірка SKIP_GITLEAKS
+    # 1. Виводимо статус при кожному коміті
+    print_status()
+
+    # 2. Перевірка SKIP_GITLEAKS
     if os.environ.get("SKIP_GITLEAKS"):
         print(yellow("⚠  SKIP_GITLEAKS встановлено — перевірку пропущено."))
         sys.exit(0)
 
-    # 2. Перевірка git config hooks.gitleaks.enable
+    # 3. Перевірка git config hooks.gitleaks.enable
     if not is_hook_enabled():
-        print(yellow("⚠  Hook вимкнено через git config (hooks.gitleaks.enable=false)."))
-        print(yellow("   Щоб увімкнути: git config hooks.gitleaks.enable true"))
-        sys.exit(0)
+        sys.exit(0)  # повідомлення вже виведено у print_status()
 
-    # 3. Перевірка/встановлення gitleaks
+    # 4. Перевірка/встановлення gitleaks
     gitleaks_bin = check_or_install_gitleaks()
     print(green(f"✔  gitleaks: {gitleaks_bin}"))
 
